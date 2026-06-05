@@ -55,6 +55,12 @@ bool tts_speak(const char* text) {
             size_t to_read = min((size_t)avail, TTS_BUF - total);
             total += stream->readBytes(buf + total, to_read);
         } else if (!http.connected()) {
+            // Connection closed — drain any bytes still in the TCP buffer
+            while (total < TTS_BUF) {
+                int rem = stream->available();
+                if (rem <= 0) break;
+                total += stream->readBytes(buf + total, min((size_t)rem, TTS_BUF - total));
+            }
             break;
         } else {
             delay(5);

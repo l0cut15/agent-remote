@@ -15,6 +15,7 @@ static const uint32_t COL_TRANS_BG = 0x0841;  // very dark blue-grey
 static const uint32_t COL_LABEL    = 0x8410;  // mid-grey label text
 
 // Word-wrap text into a panel. font_size 1 = 6×9px, font_size 2 = 12×18px.
+// Truncates with "..." if text overflows the panel.
 static void draw_wrapped(const char* text, int x, int y, int w, int h,
                          uint32_t bg, uint32_t fg, int font_size) {
     M5.Display.fillRect(x, y, w, h, bg);
@@ -32,6 +33,11 @@ static void draw_wrapped(const char* text, int x, int y, int w, int h,
     int row = 0;
     const char* p = text;
 
+    // Ring buffer tracking last 3 drawn character positions for "..." placement
+    int tail_x[3] = {x + 2, x + 2, x + 2};
+    int tail_y[3] = {y + 2, y + 2, y + 2};
+    int tail_i = 0;
+
     while (*p && row < rows) {
         const char* word_start = p;
         while (*p && *p != ' ' && *p != '\n') p++;
@@ -46,6 +52,9 @@ static void draw_wrapped(const char* text, int x, int y, int w, int h,
         }
 
         for (int i = 0; i < wlen && row < rows; i++) {
+            tail_x[tail_i % 3] = cx;
+            tail_y[tail_i % 3] = cy;
+            tail_i++;
             M5.Display.drawChar(word_start[i], cx, cy);
             cx += fw;
             if ((cx - (x + 2)) / fw >= cols) {
@@ -55,8 +64,17 @@ static void draw_wrapped(const char* text, int x, int y, int w, int h,
             }
         }
 
-        if (*p == '\n')      { cx = x + 2; cy += fh; row++; p++; }
-        else if (*p == ' ')  { cx += fw; p++; }
+        if (*p == '\n')     { cx = x + 2; cy += fh; row++; p++; }
+        else if (*p == ' ') { cx += fw; p++; }
+    }
+
+    // If text was clipped, overwrite last 3 chars with "..."
+    if (*p) {
+        for (int i = 0; i < 3; i++) {
+            int ti = (tail_i + i) % 3;
+            M5.Display.fillRect(tail_x[ti], tail_y[ti], fw, fh, bg);
+            M5.Display.drawChar('.', tail_x[ti], tail_y[ti]);
+        }
     }
 }
 
