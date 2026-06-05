@@ -2,17 +2,20 @@
 """
 STT server latency benchmark.
 
-Generates speech audio with macOS `say`, sends identical WAV files to each
-server N times, and prints latency stats + transcription quality side-by-side.
+Sends a WAV file to each whisper.cpp server N times and compares latency
+and transcription quality side-by-side.
 
 Usage:
-    python3 bench/stt_bench.py               # 5 runs, default phrases
-    python3 bench/stt_bench.py --runs 10 -v  # 10 runs, verbose per-run output
-    python3 bench/stt_bench.py --phrase "Hello world"   # single custom phrase
+    # Use a pre-recorded WAV (recommended — real mic audio)
+    python3 bench/stt_bench.py --file bench/sample.wav
+    python3 bench/stt_bench.py --file bench/sample.wav --runs 10 -v
+
+    # Generate synthetic audio via macOS say (fallback, no mic needed)
+    python3 bench/stt_bench.py --phrase "What is the weather like today?"
+    python3 bench/stt_bench.py   # runs all default phrases via say
 
 Requirements:
     pip install requests
-    macOS only (uses `say` + `afconvert` for audio generation)
 """
 
 import argparse
@@ -106,7 +109,23 @@ def transcribe(url: str, wav_path: str, extra: dict, timeout: int = 60) -> tuple
 
 # ── Benchmark runner ──────────────────────────────────────────────────────────
 
-def run_bench(phrases: list, runs: int, verbose: bool) -> None:
+def run_bench_file(wav_path: str, runs: int, verbose: bool) -> None:
+    """Benchmark using a single pre-recorded WAV file."""
+    sep = "─" * 70
+    size = os.path.getsize(wav_path)
+    # Best-effort duration: assume 16kHz 16-bit mono (44-byte WAV header)
+    duration = max(0, (size - 44)) / (16000 * 2)
+
+    print(f"\n{sep}")
+    print(f"File    : {wav_path}")
+    print(f"Audio   : {size:,} bytes  (~{duration:.1f}s)\n")
+
+    _run_servers(wav_path, runs, verbose)
+    print(sep)
+
+
+def run_bench_phrases(phrases: list, runs: int, verbose: bool) -> None:
+    """Benchmark using macOS say-generated audio for each phrase."""
     sep = "─" * 70
 
     for phrase in phrases:
@@ -116,50 +135,52 @@ def run_bench(phrases: list, runs: int, verbose: bool) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             wav = os.path.join(tmpdir, "test.wav")
             size = make_wav(phrase, wav)
-            duration = (size - 44) / (16000 * 2)  # bytes → seconds (16kHz 16-bit mono)
+            duration = (size - 44) / (16000 * 2)
             print(f"Audio   : {size:,} bytes  ({duration:.2f}s @ 16 kHz 16-bit mono)\n")
-
-            results = {}
-            for name, cfg in SERVERS.items():
-                latencies = []
-                transcripts = []
-                errors = 0
-
-                for i in range(runs):
-                    try:
-                        lat, txt = transcribe(cfg["url"], wav, cfg["extra"])
-                        latencies.append(lat)
-                        transcripts.append(txt)
-                        if verbose:
-                            print(f"  [{i+1}/{runs}] {name.split()[0]:5s}  {lat:.2f}s  → {txt!r}")
-                    except Exception as e:
-                        errors += 1
-                        if verbose:
-                            print(f"  [{i+1}/{runs}] {name.split()[0]:5s}  ERROR: {e}")
-
-                results[name] = (latencies, transcripts, errors)
-
-            # Print summary table for this phrase
-            for name, (latencies, transcripts, errors) in results.items():
-                print(f"  {name}")
-                if not latencies:
-                    print(f"    ALL {runs} RUNS FAILED")
-                    continue
-
-                mean = statistics.mean(latencies)
-                med  = statistics.median(latencies)
-                mn   = min(latencies)
-                mx   = max(latencies)
-                p95  = sorted(latencies)[int(len(latencies) * 0.95)]
-                best = max(set(transcripts), key=transcripts.count)
-
-                print(f"    transcript : {best!r}")
-                print(f"    mean {mean:.2f}s   median {med:.2f}s   "
-                      f"min {mn:.2f}s   max {mx:.2f}s   p95 {p95:.2f}s"
-                      + (f"   errors {errors}" if errors else ""))
-                print()
+            _run_servers(wav, runs, verbose)
 
     print(sep)
+
+
+def _run_servers(wav: str, runs: int, verbose: bool) -> None:
+    results = {}
+    for name, cfg in SERVERS.items():
+        latencies = []
+        transcripts = []
+        errors = 0
+
+        for i in range(runs):
+            try:
+                lat, txt = transcribe(cfg["url"], wav, cfg["extra"])
+                latencies.append(lat)
+                transcripts.append(txt)
+                if verbose:
+                    print(f"  [{i+1}/{runs}] {name.split()[0]:5s}  {lat:.2f}s  → {txt!r}")
+            except Exception as e:
+                errors += 1
+                if verbose:
+                    print(f"  [{i+1}/{runs}] {name.split()[0]:5s}  ERROR: {e}")
+
+        results[name] = (latencies, transcripts, errors)
+
+    for name, (latencies, transcripts, errors) in results.items():
+        print(f"  {name}")
+        if not latencies:
+            print(f"    ALL {runs} RUNS FAILED\n")
+            continue
+
+        mean = statistics.mean(latencies)
+        med  = statistics.median(latencies)
+        mn   = min(latencies)
+        mx   = max(latencies)
+        p95  = sorted(latencies)[int(len(latencies) * 0.95)]
+        best = max(set(transcripts), key=transcripts.count)
+
+        print(f"    transcript : {best!r}")
+        print(f"    mean {mean:.2f}s   median {med:.2f}s   "
+              f"min {mn:.2f}s   max {mx:.2f}s   p95 {p95:.2f}s"
+              + (f"   errors {errors}" if errors else ""))
+        print()
 
 
 # ── Connectivity pre-check ────────────────────────────────────────────────────
@@ -185,21 +206,27 @@ def check_servers() -> bool:
 def main():
     parser = argparse.ArgumentParser(description="STT server latency benchmark")
     parser.add_argument("--runs",   type=int, default=5,
-                        help="Requests per phrase per server (default 5)")
+                        help="Requests per server (default 5)")
+    parser.add_argument("--file",   type=str, default=None,
+                        help="Pre-recorded WAV file to use (skips say generation)")
     parser.add_argument("--phrase", type=str, default=None,
-                        help="Single custom phrase instead of the default set")
+                        help="Generate audio from this phrase via macOS say")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Print result of every individual request")
     args = parser.parse_args()
 
-    phrases = [args.phrase] if args.phrase else DEFAULT_PHRASES
-
     print("STT Benchmark")
-    print(f"  {args.runs} runs × {len(phrases)} phrase(s) × {len(SERVERS)} servers\n")
+    print(f"  {args.runs} runs × {len(SERVERS)} servers\n")
     print("Checking connectivity …")
     check_servers()
 
-    run_bench(phrases, args.runs, args.verbose)
+    if args.file:
+        if not os.path.exists(args.file):
+            sys.exit(f"File not found: {args.file}")
+        run_bench_file(args.file, args.runs, args.verbose)
+    else:
+        phrases = [args.phrase] if args.phrase else DEFAULT_PHRASES
+        run_bench_phrases(phrases, args.runs, args.verbose)
 
 
 if __name__ == "__main__":
