@@ -146,11 +146,25 @@ RIFF chunk → fmt subchunk (PCM, 1 ch, 16000 Hz, 16-bit) → data subchunk
 
 ### whisper.cpp (port 7124)
 
+Endpoint used: `POST /inference` (multipart/form-data, `file` field only).
+
+**Docker (recommended):**
+```bash
+# Download model once
+mkdir -p servers/whisper-stt/models
+wget -O servers/whisper-stt/models/ggml-small.en.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin
+
+cd servers/whisper-stt && docker compose up -d
+```
+
+**macOS bare process:**
 ```bash
 whisper-server --model models/ggml-small.en.bin --host 0.0.0.0 --port 7124
 ```
 
-Endpoint used: `POST /inference` (multipart/form-data, `file` field only).
+Benchmarked on 18 s of speech: Apple Silicon ~0.25 s, AMD 5900X Docker CPU ~3.5 s.
+Both produce identical transcripts.
 
 ### Qwen3.6-35B-A3B-MLX-8bit (port 7123)
 

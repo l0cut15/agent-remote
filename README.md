@@ -56,20 +56,27 @@ Three servers must be running and reachable on your local network before flashin
 
 ### 1. whisper.cpp — Speech-to-Text (port 7124)
 
+**Docker (recommended — always-on, self-contained):**
+
 ```bash
-brew install whisper-cpp          # macOS
-whisper-server \
-  --model models/ggml-small.en.bin \
-  --host 0.0.0.0 \
-  --port 7124
+# Download model once
+mkdir -p servers/whisper-stt/models
+wget -O servers/whisper-stt/models/ggml-small.en.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin
+
+# Start
+cd servers/whisper-stt && docker compose up -d
 ```
 
-Or use the helper script:
+**macOS bare process (faster — Apple Silicon ~0.25 s/18 s clip):**
 
 ```bash
+brew install whisper-cpp
 chmod +x servers/whisper-stt/start.sh
 ./servers/whisper-stt/start.sh
 ```
+
+> **Note:** Docker on CPU (AMD 5900X) transcribes ~3–4× real-time; Apple Silicon transcribes ~70× real-time. Both produce identical output. Use Docker on an always-on server, bare process on the Mac for lowest latency.
 
 ### 2. Qwen3.6-35B — LLM (port 7123)
 
