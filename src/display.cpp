@@ -14,6 +14,33 @@ static const uint32_t COL_RESP_BG  = 0x0420;  // very dark green
 static const uint32_t COL_TRANS_BG = 0x0841;  // very dark blue-grey
 static const uint32_t COL_LABEL    = 0x8410;  // mid-grey label text
 
+// Replace common multi-byte UTF-8 punctuation with ASCII equivalents so
+// drawChar (single-byte) doesn't render each byte as a separate glyph.
+static void sanitize_utf8(const char* src, char* dst, size_t dst_size) {
+    size_t out = 0;
+    const unsigned char* p = (const unsigned char*)src;
+    while (*p && out < dst_size - 1) {
+        // 3-byte UTF-8 sequences starting with E2 80 xx (General Punctuation block)
+        if (p[0] == 0xE2 && p[1] == 0x80) {
+            char rep = '\'';
+            switch (p[2]) {
+                case 0x98: case 0x99: rep = '\''; break;  // ' '
+                case 0x9C: case 0x9D: rep = '"';  break;  // " "
+                case 0x93: case 0x94: rep = '-';  break;  // – —
+                case 0xA6:            rep = '.';  break;  // … (just use '.')
+                default:              rep = ' ';  break;
+            }
+            dst[out++] = rep;
+            p += 3;
+            continue;
+        }
+        // Skip any other non-ASCII byte (drop rather than show garbage)
+        if (p[0] > 0x7F) { p++; continue; }
+        dst[out++] = (char)*p++;
+    }
+    dst[out] = '\0';
+}
+
 // Word-wrap text into a panel. font_size 1 = 6×9px, font_size 2 = 12×18px.
 // Truncates with "..." if text overflows the panel.
 static void draw_wrapped(const char* text, int x, int y, int w, int h,
@@ -103,16 +130,20 @@ void display_status(const char* label, uint32_t bg_color) {
 }
 
 void display_response(const char* text) {
+    char safe[512];
+    sanitize_utf8(text, safe, sizeof(safe));
     M5.Display.fillRect(0, RESP_Y, SCR_W, RESP_H, COL_RESP_BG);
     draw_label("AI:", RESP_Y, RESP_H, COL_RESP_BG);
-    draw_wrapped(text, 3, RESP_Y + 14, SCR_W - 6, RESP_H - 16, COL_RESP_BG, TFT_WHITE, 2);
+    draw_wrapped(safe, 3, RESP_Y + 14, SCR_W - 6, RESP_H - 16, COL_RESP_BG, TFT_WHITE, 2);
     M5.Display.drawFastHLine(0, RESP_Y + RESP_H, SCR_W, 0x4208);
 }
 
 void display_transcript(const char* text) {
+    char safe[256];
+    sanitize_utf8(text, safe, sizeof(safe));
     M5.Display.fillRect(0, TRANS_Y, SCR_W, TRANS_H, COL_TRANS_BG);
     draw_label("You:", TRANS_Y, TRANS_H, COL_TRANS_BG);
-    draw_wrapped(text, 3, TRANS_Y + 14, SCR_W - 6, TRANS_H - 16, COL_TRANS_BG, TFT_WHITE, 1);
+    draw_wrapped(safe, 3, TRANS_Y + 14, SCR_W - 6, TRANS_H - 16, COL_TRANS_BG, TFT_WHITE, 1);
     M5.Display.drawFastHLine(0, TRANS_Y + TRANS_H, SCR_W, 0x4208);
 }
 
