@@ -1,56 +1,43 @@
-# AI Agent Voice Control — M5Stack Core S3 SE
+# AI Agent Voice Control — Architecture
 
-Architecture and implementation plan for a standalone WiFi-connected AI agent voice controller running on the M5Stack Core S3 SE.
-
----
-
-## Hardware Overview
-
-| Feature | M5Stack Core S3 SE spec |
-|---------|------------------------|
-| MCU | ESP32-S3FN8 (dual-core LX7, 240 MHz) |
-| RAM | 512 KB SRAM + 8 MB PSRAM |
-| Flash | 16 MB |
-| Display | 2.0" IPS LCD, 320×240, capacitive touch |
-| Microphone | SPM1423 PDM mic (I2S) |
-| Speaker | 1 W via AW88298 class-D amp (I2C + I2S) |
-| Connectivity | WiFi 802.11 b/g/n, BLE 5.0 |
-| Battery | 900 mAh Li-Po |
-| Buttons | A (front), B/C (side), Power |
-
-The 8 MB PSRAM is essential — it's what makes buffering ~5 seconds of 16 kHz audio (≈160 KB) and an MP3 response comfortable without fighting the heap.
+M5Stack Core S3 SE standalone WiFi voice assistant. Touch to speak, fully local pipeline.
 
 ---
 
 ## Pipeline
 
 ```
-[Button A / Wake Word]
+[Touch screen — bottom zone held]
         │
         ▼
-[Record PCM from SPM1423 mic via I2S]
-[store in PSRAM — 16 kHz, 16-bit mono]
+[Record PCM from SPM1423 mic — I2S PDM mode]
+[16 kHz, 16-bit mono, stored in PSRAM ring buffer]
         │
         ▼
-[HTTP POST → local whisper.cpp server]
-        │  /v1/audio/transcriptions
+[HTTP POST → whisper.cpp]          port 7124
+[endpoint: /inference]
+[body: multipart/form-data, file=WAV]
+        │
         ▼
 [Transcript text]
         │
         ▼
-[HTTP POST → local Qwen LLM]
-        │  /v1/chat/completions (OpenAI-compat)
+[HTTP POST → Qwen3.6-35B LLM]     port 7123
+[endpoint: /v1/chat/completions]
+[chat_template_kwargs: {enable_thinking: false}]
+        │
         ▼
 [Response text]
         │
         ▼
-[HTTPS POST → OpenAI TTS API]
-        │  audio/speech → mp3
+[HTTP POST → Kokoro TTS]           port 7235
+[endpoint: /v1/audio/speech]
+[response_format: pcm, 24 kHz 16-bit mono]
+[http.useHTTP10(true) — avoids chunked encoding corruption]
+        │
         ▼
-[Decode MP3 → PCM via I2S → AW88298 → Speaker]
+[PCM buffered in PSRAM → AW88298 amp → Speaker]
 ```
-
-STT and LLM are local (plain HTTP, no key). Only TTS goes to OpenAI over HTTPS.
 
 ---
 
@@ -58,25 +45,19 @@ STT and LLM are local (plain HTTP, no key). Only TTS goes to OpenAI over HTTPS.
 
 ```
 IDLE
-  │  button press (or wake word detected)
+  │  touch held in bottom zone
   ▼
-LISTENING  ── button released / silence timeout ──▶ TRANSCRIBING
-  │  (recording audio into PSRAM ring buffer)          │
-  │                                                     ▼
-  │                                              STT_PENDING
-  │                                                     │ transcript received
-  │                                                     ▼
-  │                                              LLM_PENDING
-  │                                                     │ response received
-  │                                                     ▼
-  │                                              TTS_PENDING
-  │                                                     │ audio received
-  │                                                     ▼
-  │                                               SPEAKING
-  │                                                     │ playback complete
-  └─────────────────────────────────────────────────── IDLE
+RECORDING  ── touch released / 8 s timeout ──▶  STT_PENDING
+  │  mic active, PCM into PSRAM                       │ whisper.cpp call
+  │                                                   ▼
+  │                                            LLM_PENDING
+  │                                                   │ Qwen3 call
+  │                                                   ▼
+  │                                            SPEAKING
+  │                                                   │ Kokoro TTS + playRaw
+  └───────────────────────────────────────────────── IDLE
 
-Any state ── network error / API error ──▶ ERROR (show message, auto-return to IDLE)
+Any state ── STT/LLM/TTS failure ──▶ show error text ──▶ IDLE
 ```
 
 ---
@@ -85,225 +66,149 @@ Any state ── network error / API error ──▶ ERROR (show message, auto-r
 
 ```
 src/
-  main.cpp          — setup(), loop(), state machine, WiFi init
-  audio_capture.cpp — I2S PDM config, start/stop recording, ring buffer in PSRAM
+  main.cpp          — setup(), loop(), 5-state machine, WiFi, touch input
+  audio_capture.cpp — SPM1423 PDM mic via M5Unified, PSRAM ring buffer, chunk recording
   audio_capture.h
-  audio_playback.cpp — I2S DAC config, AW88298 amp control (I2C), MP3 decode + stream
+  audio_playback.cpp — M5Unified Speaker, raw PCM playback
   audio_playback.h
-  stt.cpp           — multipart HTTP POST to local whisper.cpp, parse JSON transcript
+  stt.cpp           — WAV header + multipart POST to whisper.cpp, JSON parse
   stt.h
-  llm.cpp           — HTTP POST to local Qwen (OpenAI-compat), parse response text
+  llm.cpp           — HTTP POST to Qwen3, think-tag stripping, response parse
   llm.h
-  tts.cpp           — HTTPS POST to OpenAI TTS, receive MP3 bytes
+  tts.cpp           — HTTP POST to Kokoro, PCM stream into PSRAM, speaker playback
   tts.h
-  display.cpp       — status screen, waveform animation, text scroll
+  display.cpp       — 4-zone layout: state bar / AI panel / transcript / touch bar
   display.h
-  config.h          — constants (SAMPLE_RATE, REC_MAX_BYTES); secrets loaded from LittleFS
+  secrets.cpp       — LittleFS mount, JSON parse into Secrets struct
+  secrets.h
+  config.h          — SAMPLE_RATE=16000, REC_MAX_BYTES=256*1024
 ```
-
-Secrets are never compiled in. They live in `data/secrets.json` on LittleFS, loaded at boot. OTA firmware updates don't wipe credentials.
 
 ---
 
-## Key Libraries (PlatformIO)
+## Display Layout
 
-```ini
-[env:m5stack-cores3]
-platform = espressif32
-board = m5stack-cores3
-framework = arduino
-board_build.filesystem = littlefs
-board_build.partitions = default_16MB.csv
-board_build.f_cpu = 240000000
-monitor_speed = 115200
+Screen: 320 × 240 px
 
-lib_deps =
-    m5stack/M5Unified @ ^0.2.4        ; hardware abstraction (screen, IMU, power)
-    m5stack/M5GFX @ ^0.2.4            ; display rendering
-    bblanchon/ArduinoJson @ ^7.0.0    ; JSON parse/build
-    earlephilhower/ESP8266Audio @ ^1.9.7  ; MP3 decode + I2S output
-```
+| Zone | Y range | Content |
+|------|---------|---------|
+| State bar | 0–50 | Pipeline state, coloured background |
+| AI panel | 50–175 | LLM response, font size 2, word-wrapped |
+| Transcript | 175–205 | STT output, font size 1 |
+| Touch zone | 205–240 | "Hold to speak" / "Recording…" bar |
 
-`M5Unified` handles the AW88298 speaker amp initialisation so you don't need to bit-bang its I2C registers manually.
+State bar colours (RGB565):
+
+| State | Colour |
+|-------|--------|
+| READY | `0x0010` navy |
+| RECORDING | `0xA000` dark red |
+| THINKING (STT) | `0x8400` dark orange |
+| THINKING (LLM) | `0x4010` dark purple |
+| SPEAKING | `0x0400` dark green |
 
 ---
 
-## Audio Capture Detail
+## Key Implementation Details
 
-The SPM1423 is a PDM microphone connected via I2S in PDM mode.
+### I2S Peripheral Sharing
+The SPM1423 mic and AW88298 speaker share the I2S peripheral on the Core S3 SE. Hard rule: always call `M5.Speaker.end()` before `M5.Mic.begin()` and `M5.Mic.end()` before `M5.Speaker.begin()`. Failure to do so causes "register I2S object to platform failed" and silence.
 
+### Speaker Stack Size
+`dma_buf_len` in `speaker_config_t` controls the speaker task stack: `stack = 1280 + dma_buf_len * 4`. Default `dma_buf_len=256` gives a 2304-byte stack which overflows. Set `dma_buf_len=1024` → 5376-byte stack.
+
+### HTTP/1.0 for TTS
+Kokoro returns `Transfer-Encoding: chunked`. `HTTPClient::getStreamPtr()` returns the raw TCP stream without decoding chunk headers, so they land in the PCM buffer as noise. `http.useHTTP10(true)` forces HTTP/1.0 and eliminates chunked encoding.
+
+### Qwen3 Thinking Mode
+Qwen3 defaults to chain-of-thought reasoning. Disable it with:
+```json
+"chat_template_kwargs": {"enable_thinking": false}
+```
+Additionally, user messages are prefixed with `/no_think` and `strip_think_tags()` removes any `<think>...</think>` blocks that slip through.
+
+### PSRAM Allocation
+All large buffers must use PSRAM — internal SRAM is only 512 KB:
 ```cpp
-// Typical I2S PDM config for SPM1423 on Core S3 SE
-i2s_config_t mic_cfg = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM),
-    .sample_rate = 16000,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = I2S_COMM_FORMAT_STAND_PCM_SHORT,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 8,
-    .dma_buf_len = 512,
-};
-// CLK pin: GPIO 0, DATA pin: GPIO 34 (verify against M5Unified pin map)
+heap_caps_malloc(size, MALLOC_CAP_SPIRAM)
 ```
+Always check for null. Record buffer: 256 KB. TTS PCM buffer: 600 KB.
 
-Record into a `uint8_t*` buffer allocated with `heap_caps_malloc(size, MALLOC_CAP_SPIRAM)` — PSRAM, not internal RAM. Cap recording at ~8 seconds (256 KB) to stay well inside PSRAM budget.
+### WAV Header for STT
+whisper.cpp `/inference` expects a WAV file. Prepend a 44-byte WAV header to raw PCM before POSTing:
+```
+RIFF chunk → fmt subchunk (PCM, 1 ch, 16000 Hz, 16-bit) → data subchunk
+```
 
 ---
 
-## API Calls
+## Server Configuration
 
-### 1. Speech-to-Text — local whisper.cpp
+### whisper.cpp (port 7124)
 
-```
-POST http://<stt_host>:<stt_port>/v1/audio/transcriptions
-Content-Type: multipart/form-data
-
-file=<WAV bytes>
-model=whisper-1
-language=en
-response_format=json
+```bash
+whisper-server --model models/ggml-small.en.bin --host 0.0.0.0 --port 7124
 ```
 
-Send the PCM buffer as a WAV file (prepend a 44-byte WAV header to the raw PCM before POSTing). Use plain `HTTPClient` — no TLS needed for local server.
+Endpoint used: `POST /inference` (multipart/form-data, `file` field only).
 
-Response:
-```json
-{ "text": "What's the weather like today?" }
+### Qwen3.6-35B-A3B-MLX-8bit (port 7123)
+
+Any OpenAI-compatible server. MLX-LM example:
+```bash
+mlx_lm.server --model mlx-community/Qwen3.6-35B-A3B-MLX-8bit --host 0.0.0.0 --port 7123
 ```
 
-### 2. LLM — local Qwen (OpenAI-compatible)
+Model name sent in requests: `"Qwen3.6-35B-A3B-MLX-8bit"` (exact, case-sensitive).
 
-```
-POST http://<llm_host>:<llm_port>/v1/chat/completions
-Content-Type: application/json
+### Kokoro TTS (port 7235)
 
-{
-  "model": "qwen",
-  "max_tokens": 300,
-  "messages": [
-    { "role": "system", "content": "You are a concise voice assistant. Keep responses under 3 sentences." },
-    { "role": "user", "content": "<transcript>" }
-  ]
-}
-```
+See `servers/kokoro-tts/docker-compose.yml`. CPU-only, runs on any x86-64 host.
 
-Response → `choices[0].message.content`. Use plain `HTTPClient` — no TLS needed for local server.
-
-Keep `max_tokens` low (200–400) — long responses produce large TTS audio and feel bad on a speaker.
-
-For multi-turn conversation, maintain a small `messages[]` array in RAM (cap at ~6 turns to avoid memory pressure).
-
-### 3. Text-to-Speech — OpenAI TTS
-
-```
-POST https://api.openai.com/v1/audio/speech
-Authorization: Bearer <openai_key>
-Content-Type: application/json
-
-{
-  "model": "tts-1",          (tts-1-hd is higher quality, ~2× slower)
-  "voice": "nova",           (alloy/echo/fable/onyx/nova/shimmer)
-  "input": "<response text>",
-  "response_format": "mp3"
-}
-```
-
-Stream the MP3 bytes directly into the audio decoder rather than buffering the whole file — saves ~50–100 KB RAM.
-
----
-
-## Display
-
-Use `M5GFX` / `M5Canvas` for smooth double-buffered drawing.
-
-| State | Display |
-|-------|---------|
-| IDLE | Waveform flatline, "Hold A to speak" |
-| LISTENING | Live amplitude waveform bar |
-| TRANSCRIBING | Spinner + "Listening…" |
-| LLM_PENDING | Spinner + "Thinking…" |
-| TTS_PENDING | Spinner + "Preparing…" |
-| SPEAKING | Scrolling response text + animated waveform |
-| ERROR | Red banner + error message |
-
----
-
-## Secrets File (data/secrets.json)
-
-```json
-{
-  "wifi_ssid": "YourNetwork",
-  "wifi_pass": "YourPassword",
-  "openai_key": "sk-...",
-  "stt_host": "10.10.11.111",
-  "stt_port": "7124",
-  "llm_host": "10.10.11.111",
-  "llm_port": "7123"
-}
-```
-
-Add `data/secrets.json` to `.gitignore`. Provide a `data/secrets.example.json` with empty values (already done).
+Voice used: `af_sky`. Output: raw PCM, 24 kHz, 16-bit signed, mono, little-endian.
 
 ---
 
 ## Memory Budget
 
-| Item | Size |
-|------|------|
-| Audio record buffer (8 s @ 16 kHz 16-bit) | ~256 KB PSRAM |
-| MP3 response buffer | ~64–128 KB PSRAM |
-| Conversation history (6 turns) | ~10 KB heap |
-| TLS session (WiFiClientSecure, TTS only) | ~40 KB heap |
-| M5GFX canvas (320×240×2) | ~150 KB heap |
-| **Total** | well within 8 MB PSRAM + 512 KB SRAM |
+| Buffer | Location | Size |
+|--------|----------|------|
+| Audio record (8 s @ 16 kHz 16-bit) | PSRAM | 256 KB |
+| TTS PCM (12 s @ 24 kHz 16-bit) | PSRAM | 600 KB |
+| LLM response string | heap | ~1 KB |
+| Transcript string | heap | ~512 B |
+| **Total PSRAM** | | ~856 KB of 8 MB |
 
 ---
 
-## Build Phases
+## Secrets File
 
-### Phase 1 — Audio I/O only
-Get mic recording and speaker playback working in isolation. Record 3 seconds on button press, play it back immediately (loopback test). Confirms I2S pin assignments are correct before involving network.
+`data/secrets.json` — loaded from LittleFS at boot, never compiled in, gitignored.
 
-### Phase 2 — WiFi + STT
-Connect to WiFi, POST a hardcoded WAV clip to local whisper.cpp, print transcript to Serial. Confirms HTTP + local server connection works.
+```json
+{
+  "wifi_ssid": "",
+  "wifi_pass": "",
+  "openai_key": "",
+  "stt_host": "10.10.11.x",
+  "stt_port": "7124",
+  "llm_host": "10.10.11.x",
+  "llm_port": "7123",
+  "tts_host": "10.10.11.x",
+  "tts_port": "7235"
+}
+```
 
-### Phase 3 — Full pipeline (no display)
-Wire all three calls together: Button → record → whisper.cpp → Qwen → OpenAI TTS → speaker. Status goes to Serial only.
-
-### Phase 4 — Display + state machine
-Add the UI. Transition through states with appropriate screen content.
-
-### Phase 5 — Polish
-- Wake word (ESP-SR `AFE` + `WakeNet`) so hands-free works
-- Conversation memory (multi-turn `messages[]`)
-- Volume control (side buttons)
-- Battery indicator
+Note: `openai_key` is present in the struct but not currently used — TTS is fully local.
 
 ---
 
-## Optional: Wake Word (Phase 5)
+## Future Work
 
-Espressif's `esp-sr` library runs entirely on-device:
-
-```
-ESP-SR AFE (Acoustic Front End)
-  → noise suppression + echo cancellation
-  → WakeNet (custom phrase or built-in English keyword)
-      → triggers LISTENING state
-```
-
-Wake word models are ~200 KB flash. Custom wake words require Espressif's model training service or you can use one of the built-in English phrases.
-
----
-
-## Server Setup (required before Phase 2)
-
-whisper.cpp must be running on the Mac at the configured `stt_host` before testing STT:
-
-```bash
-brew install whisper-cpp
-whisper-server --model models/ggml-small.en.bin --host 0.0.0.0 --port 7124
-```
-
-The Qwen model must be running at `llm_host:llm_port` with an OpenAI-compatible `/v1/chat/completions` endpoint.
+| Feature | Notes |
+|---------|-------|
+| Wake word | ESP-SR WakeNet, ~200 KB flash, hands-free trigger |
+| Multi-turn memory | Keep `messages[]` capped at 6 turns |
+| Volume control | Side buttons B/C |
+| Battery indicator | M5.Power.getBatteryLevel() |
+| Silence detection | Energy threshold on mic input to skip silent recordings |

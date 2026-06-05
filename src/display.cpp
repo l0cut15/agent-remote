@@ -1,76 +1,104 @@
 #include "display.h"
 #include <M5Unified.h>
 #include <string.h>
-#include <stdarg.h>
-#include <stdio.h>
 
-static const int SCR_W    = 320;
-static const int STATUS_H = 80;   // top status bar height
-static const int DIV_Y    = STATUS_H;
-static const int LOG_Y    = DIV_Y + 1;
-static const int LOG_LINE = 15;   // pixels per log line (font2 = 12px + 3 gap)
-static const int LOG_COLS = 53;   // max chars per line at font size 1
-static const int LOG_ROWS = (240 - LOG_Y) / LOG_LINE;  // 10 rows
+static const int SCR_W = 320;
 
-static char _lines[12][LOG_COLS + 1];
-static int  _nlines = 0;
+// Zone boundaries
+static const int STATUS_Y = 0;   static const int STATUS_H = 50;
+static const int RESP_Y   = 50;  static const int RESP_H   = 125;  // AI response — big
+static const int TRANS_Y  = 175; static const int TRANS_H  = 30;   // You transcript — compact
+// DISP_TOUCH_Y = 205, touch zone to 240 — defined in display.h
 
-static void redraw_log() {
-    M5.Display.fillRect(0, LOG_Y, SCR_W, 240 - LOG_Y, TFT_BLACK);
-    M5.Display.setTextSize(1);
-    M5.Display.setTextColor(0xAD75, TFT_BLACK);  // light grey
-    for (int i = 0; i < _nlines; i++) {
-        M5.Display.setCursor(3, LOG_Y + i * LOG_LINE + 2);
-        M5.Display.print(_lines[i]);
+static const uint32_t COL_RESP_BG  = 0x0420;  // very dark green
+static const uint32_t COL_TRANS_BG = 0x0841;  // very dark blue-grey
+static const uint32_t COL_LABEL    = 0x8410;  // mid-grey label text
+
+// Word-wrap text into a panel. font_size 1 = 6×9px, font_size 2 = 12×18px.
+static void draw_wrapped(const char* text, int x, int y, int w, int h,
+                         uint32_t bg, uint32_t fg, int font_size) {
+    M5.Display.fillRect(x, y, w, h, bg);
+    if (!text || !text[0]) return;
+
+    const int fw = font_size == 2 ? 12 : 6;
+    const int fh = font_size == 2 ? 18 : 9;
+    int cols = w / fw;
+    int rows = h / fh;
+
+    M5.Display.setTextSize(font_size);
+    M5.Display.setTextColor(fg, bg);
+
+    int cx = x + 2, cy = y + 2;
+    int row = 0;
+    const char* p = text;
+
+    while (*p && row < rows) {
+        const char* word_start = p;
+        while (*p && *p != ' ' && *p != '\n') p++;
+        int wlen = p - word_start;
+
+        int cur_col = (cx - (x + 2)) / fw;
+        if (cur_col > 0 && cur_col + wlen > cols) {
+            cx = x + 2;
+            cy += fh;
+            row++;
+            if (row >= rows) break;
+        }
+
+        for (int i = 0; i < wlen && row < rows; i++) {
+            M5.Display.drawChar(word_start[i], cx, cy);
+            cx += fw;
+            if ((cx - (x + 2)) / fw >= cols) {
+                cx = x + 2;
+                cy += fh;
+                row++;
+            }
+        }
+
+        if (*p == '\n')      { cx = x + 2; cy += fh; row++; p++; }
+        else if (*p == ' ')  { cx += fw; p++; }
     }
+}
+
+static void draw_label(const char* label, int y, int h, uint32_t bg) {
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(COL_LABEL, bg);
+    M5.Display.setCursor(3, y + 2);
+    M5.Display.print(label);
+    M5.Display.drawFastHLine(0, y + 11, SCR_W, 0x2104);
 }
 
 void display_init() {
     M5.Display.fillScreen(TFT_BLACK);
-    M5.Display.drawFastHLine(0, DIV_Y, SCR_W, 0x4208);
-    display_status("INIT", "Starting up...", 0x2104);
+    display_status("INIT", 0x2104);
+    display_clear_conversation();
 }
 
-void display_status(const char* label, const char* sub, uint32_t bg_color) {
-    M5.Display.fillRect(0, 0, SCR_W, STATUS_H, bg_color);
-    M5.Display.drawFastHLine(0, DIV_Y, SCR_W, 0x4208);
-
-    // Large label — font size 4 = 24x32px per char
-    M5.Display.setTextSize(4);
+void display_status(const char* label, uint32_t bg_color) {
+    M5.Display.fillRect(0, STATUS_Y, SCR_W, STATUS_H, bg_color);
+    M5.Display.setTextSize(3);
     M5.Display.setTextColor(TFT_WHITE, bg_color);
     int lw = M5.Display.textWidth(label);
-    M5.Display.setCursor((SCR_W - lw) / 2, 8);
+    M5.Display.setCursor((SCR_W - lw) / 2, (STATUS_H - 24) / 2);
     M5.Display.print(label);
-
-    // Subtitle — font size 2 = 12x16px
-    if (sub && sub[0]) {
-        M5.Display.setTextSize(2);
-        M5.Display.setTextColor(0xC618, bg_color);  // light grey on bg
-        int sw = M5.Display.textWidth(sub);
-        M5.Display.setCursor((SCR_W - sw) / 2, 52);
-        M5.Display.print(sub);
-    }
+    M5.Display.drawFastHLine(0, STATUS_Y + STATUS_H, SCR_W, 0x4208);
 }
 
-void display_log(const char* msg) {
-    if (_nlines < LOG_ROWS) {
-        strncpy(_lines[_nlines], msg, LOG_COLS);
-        _lines[_nlines][LOG_COLS] = '\0';
-        _nlines++;
-    } else {
-        for (int i = 0; i < LOG_ROWS - 1; i++)
-            memcpy(_lines[i], _lines[i + 1], LOG_COLS + 1);
-        strncpy(_lines[LOG_ROWS - 1], msg, LOG_COLS);
-        _lines[LOG_ROWS - 1][LOG_COLS] = '\0';
-    }
-    redraw_log();
+void display_response(const char* text) {
+    M5.Display.fillRect(0, RESP_Y, SCR_W, RESP_H, COL_RESP_BG);
+    draw_label("AI:", RESP_Y, RESP_H, COL_RESP_BG);
+    draw_wrapped(text, 3, RESP_Y + 14, SCR_W - 6, RESP_H - 16, COL_RESP_BG, TFT_WHITE, 2);
+    M5.Display.drawFastHLine(0, RESP_Y + RESP_H, SCR_W, 0x4208);
 }
 
-void display_logf(const char* fmt, ...) {
-    char buf[LOG_COLS + 1];
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, args);
-    va_end(args);
-    display_log(buf);
+void display_transcript(const char* text) {
+    M5.Display.fillRect(0, TRANS_Y, SCR_W, TRANS_H, COL_TRANS_BG);
+    draw_label("You:", TRANS_Y, TRANS_H, COL_TRANS_BG);
+    draw_wrapped(text, 3, TRANS_Y + 14, SCR_W - 6, TRANS_H - 16, COL_TRANS_BG, TFT_WHITE, 1);
+    M5.Display.drawFastHLine(0, TRANS_Y + TRANS_H, SCR_W, 0x4208);
+}
+
+void display_clear_conversation() {
+    display_response("");
+    display_transcript("");
 }
